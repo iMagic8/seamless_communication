@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import List, Optional, Tuple, Union, cast
+from seamless_communication.streaming.agents import SileroVADStates
 
 import torch
 import torch.nn as nn
+import wave
 from fairseq2.assets import asset_store
 from fairseq2.assets.card import AssetCard
 from fairseq2.data import Collater, SequenceData, StringLike
@@ -230,7 +232,7 @@ class Translator(nn.Module):
     ) -> Tuple[List[StringLike], Optional[BatchedSpeechOutput]]:
         """
         The main method used to perform inference on all tasks.
-
+                               
         :param input:
             Either text or path to audio or audio Tensor.
         :param task_str:
@@ -260,169 +262,190 @@ class Translator(nn.Module):
         """
         input_modality, output_modality = self.get_modalities_from_task_str(task_str)
 
-        if self.apply_mintox and not (src_lang is not None or src_text is not None):
-            raise ValueError(
-                "`src_lang` must be specified when `apply_mintox` is `True` or you need to specify src_text."
-            )
-
-        if isinstance(input, dict):
-            src = cast(SequenceData, input)
-        elif input_modality == Modality.SPEECH:
-            audio = input
-            if isinstance(audio, str):
-                with Path(audio).open("rb") as fb:
-                    block = MemoryBlock(fb.read())
-                decoded_audio = self.decode_audio(block)
-            else:
-                assert (
-                    audio.dim() <= 2
-                ), "The audio tensor can't be more than 2 dimensions."
-                if audio.dim() == 1:
-                    audio = audio.unsqueeze(1)
-                elif audio.dim() == 2 and audio.size(0) < audio.size(1):
-                    logger.warning(
-                        "Transposing audio tensor from (bsz, seq_len) -> (seq_len, bsz)."
+        # If audio sample is more than 20 seconds, then segment the audio into chunks
+        with wave.open(input, "rb") as wav:
+            duration = wav.getnframes() / float(wav.getframerate())
+            if duration > 20:
+                vad_states = SileroVADStates(sample_rate=sample_rate)
+                audio_chunks = vad_states.segment_long_input(input)
+                translated_texts = []
+                batched_speech_outputs = []
+                for audio_chunk in audio_chunks:
+                    chunk_translated_text, chunk_batched_speech_output = self.predict(
+                        audio_chunk, task_str, tgt_lang, src_lang=src_lang, 
+                        text_generation_opts=text_generation_opts, 
+                        unit_generation_opts=unit_generation_opts, 
+                        spkr=spkr, 
+                        unit_generation_ngram_filtering=unit_generation_ngram_filtering, 
+                        src_text=src_text
                     )
-                    audio = audio.transpose(0, 1)
+                    translated_texts.append(chunk_translated_text)
+                    batched_speech_outputs.append(chunk_batched_speech_output)
+                return translated_texts, batched_speech_outputs
+            else:
+                if self.apply_mintox and not (src_lang is not None or src_text is not None):
+                    raise ValueError(
+                        "`src_lang` must be specified when `apply_mintox` is `True` or you need to specify src_text."
+                    )
 
-                decoded_audio = {
-                    "waveform": audio,
-                    "sample_rate": sample_rate,
-                    "format": -1,
-                }
-            src = self.collate(self.convert_to_fbank(decoded_audio))["fbank"]
-        else:
-            if src_lang is None:
-                raise ValueError("src_lang must be specified for T2ST, T2TT tasks.")
+                if isinstance(input, dict):
+                    src = cast(SequenceData, input)
+                elif input_modality == Modality.SPEECH:
+                    audio = input
+                    if isinstance(audio, str):
+                        with Path(audio).open("rb") as fb:
+                            block = MemoryBlock(fb.read())
+                        decoded_audio = self.decode_audio(block)
+                    else:
+                        assert (
+                            audio.dim() <= 2
+                        ), "The audio tensor can't be more than 2 dimensions."
+                        if audio.dim() == 1:
+                            audio = audio.unsqueeze(1)
+                        elif audio.dim() == 2 and audio.size(0) < audio.size(1):
+                            logger.warning(
+                                "Transposing audio tensor from (bsz, seq_len) -> (seq_len, bsz)."
+                            )
+                            audio = audio.transpose(0, 1)
 
-            text = input
-            assert isinstance(text, str)
-
-            self.token_encoder = self.text_tokenizer.create_encoder(
-                task="translation", lang=src_lang, mode="source", device=self.device
-            )
-            src = self.collate(self.token_encoder(text))
-
-        assert isinstance(self.model, UnitYModel)
-
-        seqs, padding_mask = get_seqs_and_padding_mask(src)
-
-        if text_generation_opts is None:
-            text_generation_opts = SequenceGeneratorOptions(
-                beam_size=5, soft_max_seq_len=(1, 200)
-            )
-        if unit_generation_opts is None:
-            unit_generation_opts = SequenceGeneratorOptions(
-                beam_size=5, soft_max_seq_len=(25, 50)
-            )
-
-        texts, units = self.get_prediction(
-            self.model,
-            self.text_tokenizer,
-            self.unit_tokenizer,
-            seqs,
-            padding_mask,
-            input_modality,
-            output_modality,
-            tgt_lang,
-            text_generation_opts,
-            unit_generation_opts,
-            unit_generation_ngram_filtering=unit_generation_ngram_filtering,
-            duration_factor=duration_factor,
-            prosody_encoder_input=prosody_encoder_input,
-        )
-
-        if self.apply_mintox and task_str != Task.ASR.name:
-            if input_modality == Modality.SPEECH:
-                if src_text is not None:
-                    src_texts = [src_text]
+                        decoded_audio = {
+                            "waveform": audio,
+                            "sample_rate": sample_rate,
+                            "format": -1,
+                        }
+                    src = self.collate(self.convert_to_fbank(decoded_audio))["fbank"]
                 else:
-                    src_texts, _, = self.predict(
-                        input=input,
-                        task_str=Task.ASR.name,
-                        tgt_lang=tgt_lang,
+                    if src_lang is None:
+                        raise ValueError("src_lang must be specified for T2ST, T2TT tasks.")
+
+                    text = input
+                    assert isinstance(text, str)
+
+                    self.token_encoder = self.text_tokenizer.create_encoder(
+                        task="translation", lang=src_lang, mode="source", device=self.device
+                    )
+                    src = self.collate(self.token_encoder(text))
+
+                assert isinstance(self.model, UnitYModel)
+
+                seqs, padding_mask = get_seqs_and_padding_mask(src)
+
+                if text_generation_opts is None:
+                    text_generation_opts = SequenceGeneratorOptions(
+                        beam_size=5, soft_max_seq_len=(1, 200)
+                    )
+                if unit_generation_opts is None:
+                    unit_generation_opts = SequenceGeneratorOptions(
+                        beam_size=5, soft_max_seq_len=(25, 50)
+                    )
+
+                texts, units = self.get_prediction(
+                    self.model,
+                    self.text_tokenizer,
+                    self.unit_tokenizer,
+                    seqs,
+                    padding_mask,
+                    input_modality,
+                    output_modality,
+                    tgt_lang,
+                    text_generation_opts,
+                    unit_generation_opts,
+                    unit_generation_ngram_filtering=unit_generation_ngram_filtering,
+                    duration_factor=duration_factor,
+                    prosody_encoder_input=prosody_encoder_input,
+                )
+
+                if self.apply_mintox and task_str != Task.ASR.name:
+                    if input_modality == Modality.SPEECH:
+                        if src_text is not None:
+                            src_texts = [src_text]
+                        else:
+                            src_texts, _, = self.predict(
+                                input=input,
+                                task_str=Task.ASR.name,
+                                tgt_lang=tgt_lang,
+                                src_lang=src_lang,
+                                text_generation_opts=text_generation_opts,
+                                unit_generation_opts=unit_generation_opts,
+                                spkr=spkr,
+                                sample_rate=sample_rate,
+                                unit_generation_ngram_filtering=unit_generation_ngram_filtering,
+                            )
+                    else:
+                        assert isinstance(input, str)
+
+                        src_texts = [input]
+
+                    assert src_lang is not None
+                    assert self.unit_tokenizer is not None
+                    assert self.bad_word_checker is not None
+
+                    texts, units = mintox_pipeline(
+                        model=self.model,
+                        text_tokenizer=self.text_tokenizer,
+                        unit_tokenizer=self.unit_tokenizer,
+                        device=self.device,
                         src_lang=src_lang,
+                        tgt_lang=tgt_lang,
+                        model_input=src,
+                        input_modality=input_modality,
+                        output_modality=output_modality,
+                        src_texts=src_texts,
+                        original_texts=texts,
+                        original_units=units,
+                        unit_generation_ngram_filtering=unit_generation_ngram_filtering,
                         text_generation_opts=text_generation_opts,
                         unit_generation_opts=unit_generation_opts,
-                        spkr=spkr,
-                        sample_rate=sample_rate,
-                        unit_generation_ngram_filtering=unit_generation_ngram_filtering,
+                        bad_word_checker=self.bad_word_checker,
+                        duration_factor=duration_factor,
+                        prosody_encoder_input=prosody_encoder_input,
                     )
-            else:
-                assert isinstance(input, str)
 
-                src_texts = [input]
+                if output_modality == Modality.TEXT:
+                    return texts, None
+                else:
+                    assert units is not None
 
-            assert src_lang is not None
-            assert self.unit_tokenizer is not None
-            assert self.bad_word_checker is not None
+                    if isinstance(self.model.t2u_model, UnitYT2UModel):
+                        # Remove the lang token for AR UnitY since the vocoder doesn't need it
+                        # in the unit sequence. tgt_lang is fed as an argument to the vocoder.
+                        units = units[:, 1:]
+                        duration_prediction = True
+                    else:
+                        # Vocoder duration predictions not required since the NAR
+                        # T2U model already predicts duration in the units.
+                        duration_prediction = False
 
-            texts, units = mintox_pipeline(
-                model=self.model,
-                text_tokenizer=self.text_tokenizer,
-                unit_tokenizer=self.unit_tokenizer,
-                device=self.device,
-                src_lang=src_lang,
-                tgt_lang=tgt_lang,
-                model_input=src,
-                input_modality=input_modality,
-                output_modality=output_modality,
-                src_texts=src_texts,
-                original_texts=texts,
-                original_units=units,
-                unit_generation_ngram_filtering=unit_generation_ngram_filtering,
-                text_generation_opts=text_generation_opts,
-                unit_generation_opts=unit_generation_opts,
-                bad_word_checker=self.bad_word_checker,
-                duration_factor=duration_factor,
-                prosody_encoder_input=prosody_encoder_input,
-            )
+                    audio_wavs = []
+                    speech_units = []
+                    for i in range(len(units)):
+                        assert self.model.t2u_model is not None
+                        unit_padding_mask = (
+                            units[i] != self.model.t2u_model.target_vocab_info.pad_idx
+                        )
+                        u = units[i][unit_padding_mask]
+                        speech_units.append(u.tolist())
 
-        if output_modality == Modality.TEXT:
-            return texts, None
-        else:
-            assert units is not None
-
-            if isinstance(self.model.t2u_model, UnitYT2UModel):
-                # Remove the lang token for AR UnitY since the vocoder doesn't need it
-                # in the unit sequence. tgt_lang is fed as an argument to the vocoder.
-                units = units[:, 1:]
-                duration_prediction = True
-            else:
-                # Vocoder duration predictions not required since the NAR
-                # T2U model already predicts duration in the units.
-                duration_prediction = False
-
-            audio_wavs = []
-            speech_units = []
-            for i in range(len(units)):
-                assert self.model.t2u_model is not None
-                unit_padding_mask = (
-                    units[i] != self.model.t2u_model.target_vocab_info.pad_idx
-                )
-                u = units[i][unit_padding_mask]
-                speech_units.append(u.tolist())
-
-            if self.vocoder is not None:
-                translated_audio_wav = self.vocoder(
-                    units, tgt_lang, spkr, dur_prediction=duration_prediction
-                )
-                for i in range(len(units)):
-                    padding_removed_audio_wav = translated_audio_wav[
-                        i,
-                        :,
-                        : int(
-                            translated_audio_wav.size(-1)
-                            * len(speech_units[i])
-                            / len(units[i])
+                    if self.vocoder is not None:
+                        translated_audio_wav = self.vocoder(
+                            units, tgt_lang, spkr, dur_prediction=duration_prediction
+                        )
+                        for i in range(len(units)):
+                            padding_removed_audio_wav = translated_audio_wav[
+                                i,
+                                :,
+                                : int(
+                                    translated_audio_wav.size(-1)
+                                    * len(speech_units[i])
+                                    / len(units[i])
+                                ),
+                            ].unsqueeze(0)
+                            audio_wavs.append(padding_removed_audio_wav)
+                    return (
+                        texts,
+                        BatchedSpeechOutput(
+                            units=speech_units,
+                            audio_wavs=audio_wavs,
+                            sample_rate=sample_rate,
                         ),
-                    ].unsqueeze(0)
-                    audio_wavs.append(padding_removed_audio_wav)
-            return (
-                texts,
-                BatchedSpeechOutput(
-                    units=speech_units,
-                    audio_wavs=audio_wavs,
-                    sample_rate=sample_rate,
-                ),
-            )
+                    )
