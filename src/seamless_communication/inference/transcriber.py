@@ -237,9 +237,10 @@ class Transcriber(nn.Module):
         filter_width: int,
         gen_opts: Dict,
     ) -> Transcription:
+        fbanks = fbanks.to('cuda')
         prefix = self.tokenizer.create_encoder(
             mode="target", lang=src_lang
-        ).prefix_indices
+        ).prefix_indices.to('cuda')
         beam_size = gen_opts.get("beam_size") or 1  # set to 1 by default
         gen_opts.pop("beam_size", None)
         generator = BeamSearchSeq2SeqGenerator(
@@ -250,9 +251,9 @@ class Transcriber(nn.Module):
 
         self.enc_dec_attn_collector.reset()
         output: SequenceGeneratorOutput = generator(
-            source_seqs=fbanks.unsqueeze(0),
+            source_seqs=fbanks.unsqueeze(0).to('cuda'),
             source_padding_mask=None,
-            prompt_seqs=prefix.unsqueeze(0),
+            prompt_seqs=prefix.unsqueeze(0).to('cuda'),
             prompt_padding_mask=None,
         )
 
